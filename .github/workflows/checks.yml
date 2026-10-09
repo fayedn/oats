@@ -1,0 +1,32 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test
+        run: cargo test --locked
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Build
+        run: cargo build --release --locked
+      - name: Check installer syntax
+        run: bash -n scripts/install.sh scripts/uninstall.sh

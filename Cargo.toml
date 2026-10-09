@@ -1,0 +1,23 @@
+[package]
+name = "oats"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A fast computer scheduler and toolkit. All in one."
+license = "MIT"
+repository = "https://github.com/fayedn/oats"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
