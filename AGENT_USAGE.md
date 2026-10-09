@@ -1,13 +1,15 @@
 # Calling oats from an agent
 
-oats schedules one-time local commands on macOS. The owner must install it once using `scripts/install.sh`. It is AC-only and cannot guarantee closed-lid wake until the owner physically tests a probe.
+oats schedules one-time local commands while macOS is awake and connected to AC. It never wakes the computer. Install once as the normal user using `scripts/install.sh`; no administrator access is needed.
 
-1. Call `/usr/local/bin/oats doctor` for read-only power diagnostics.
-2. Choose an explicit future RFC3339 timestamp with offset, a bounded runtime, an absolute executable, and an absolute working directory.
-3. Call `/usr/local/bin/oats schedule --at TIME --timeout SECONDS --cwd DIRECTORY -- EXECUTABLE ARGUMENTS...`.
-4. Parse JSON and retain `job.id`. Scheduling registers the wake; it is not evidence that the command has run.
+The executable is `$HOME/Library/Application Support/oats/bin/oats`. Quote that path when invoking it, or add its directory to PATH.
+
+1. Call `oats doctor` for read-only power diagnostics.
+2. Choose a future RFC3339 timestamp with offset, a bounded runtime, an absolute executable, and an absolute working directory.
+3. Call `oats schedule --at TIME --timeout SECONDS --grace SECONDS --cwd DIRECTORY -- EXECUTABLE ARGUMENTS...`.
+4. Parse JSON and retain `job.id`. The response confirms queueing only.
 5. Use `oats status`, `oats logs ID`, and `oats cancel ID` to track work.
 
-Do not schedule root commands, remove another app's wake events, change global power settings yourself, or keep the machine awake while waiting. Do not automatically retry a job with side effects. If the helper reports missing installation, an unhealthy service, or no AC power, surface that error to the owner.
+Jobs sleeping past their grace period are missed. Jobs due on battery are skipped. Surface missing installation, unhealthy agent, or power errors to the owner. Do not automatically retry side-effecting work.
 
-Commands run as the installation owner's user, in a minimal environment and without interactive stdin. Pass a script or command that can finish unattended. This tool does not resume existing chat sessions. A command that deliberately daemonizes is unsupported.
+Commands run with your user's permissions in a minimal environment, without interactive stdin. They are not sandboxed. Review executable, arguments, and working directory before scheduling. Pass work that finishes unattended; deliberately daemonizing commands are unsupported. oats does not resume existing chat sessions or provide root access.

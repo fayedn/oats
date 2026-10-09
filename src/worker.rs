@@ -1,4 +1,4 @@
-//! Unprivileged job supervisor. A pipe ties its lifetime to the root daemon.
+//! Unprivileged job supervisor. A pipe ties its lifetime to the user agent.
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -57,6 +57,7 @@ pub fn run(json: &str) -> Result<()> {
             }
         }
     });
+    let _assertion = crate::power::IdleAssertion::new()?;
     let mut child = Command::new(&spec.command[0])
         .args(&spec.command[1..])
         .stdin(Stdio::null())

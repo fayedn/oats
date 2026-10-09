@@ -1,19 +1,23 @@
 #!/bin/bash
 set -euo pipefail
-if [[ "$EUID" != 0 ]]; then exec sudo /bin/bash "$0"; fi
-helper=/Library/PrivilegedHelperTools/dev.oats
-state='/Library/Application Support/oats'
-plist=/Library/LaunchDaemons/dev.oats.plist
-rm -f /etc/sudoers.d/oats
-if /bin/launchctl print system/dev.oats >/dev/null 2>&1; then
-  /bin/launchctl bootout system/dev.oats
+[[ "$EUID" != 0 ]] || { echo 'Run as your normal user, without sudo.' >&2; exit 1; }
+state="$HOME/Library/Application Support/oats"
+plist="$HOME/Library/LaunchAgents/dev.oats.plist"
+if /bin/launchctl print "gui/$EUID/dev.oats" >/dev/null 2>&1; then
+  /bin/launchctl bootout "gui/$EUID/dev.oats"
 fi
-# Cleanup must succeed before deleting the helper that restores sleep and cancels its wakes.
-if [[ -x "$helper" && -f "$state/config.json" ]]; then "$helper" cleanup; fi
-rm -f /etc/sudoers.d/oats "$plist" "$helper"
-if [[ -L /usr/local/bin/oats && "$(readlink /usr/local/bin/oats)" == "$helper" ]]; then rm /usr/local/bin/oats; fi
+if [[ -x "$state/bin/oats" ]]; then
+  # bootout may return before shutdown has released the daemon lock.
+  cleaned=0
+  for attempt in {1..20}; do
+    if "$state/bin/oats" cleanup; then cleaned=1; break; fi
+    sleep 1
+  done
+  [[ "$cleaned" == 1 ]] || { echo 'Cleanup failed; installation retained.' >&2; exit 1; }
+fi
+rm -f "$plist"
 if [[ -d "$state" ]]; then
-  archive="${state}.uninstalled.$(date +%s)"
+  archive="${state}.uninstalled.$(date +%s).$$"
   mv "$state" "$archive"
-  printf 'Uninstalled. Job history and logs preserved in %s\n' "$archive"
+  printf 'Uninstalled. History and logs preserved in %s\n' "$archive"
 fi

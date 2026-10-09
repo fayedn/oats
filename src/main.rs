@@ -1,17 +1,16 @@
 mod power;
 mod service;
 mod worker;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::{
-    io::{Read, Write},
-    process::{Command, Stdio},
-};
-
-const BIN: &str = "/Library/PrivilegedHelperTools/dev.oats";
-const ROOT: &str = "/Library/Application Support/oats";
+fn root() -> Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    let home = std::path::PathBuf::from(home);
+    anyhow::ensure!(home.is_absolute(), "HOME must be absolute");
+    Ok(home.join("Library/Application Support/oats"))
+}
 
 #[derive(Parser)]
 #[command(
@@ -46,26 +45,17 @@ enum Action {
     Logs { id: String },
     /// Read-only power and installation diagnostics.
     Doctor,
-    /// Schedule a harmless date command to test a closed-lid wake.
+    /// Schedule a harmless date command to test execution while awake.
     Probe {
         #[arg(long, default_value_t = 120)]
         after: u64,
     },
-    #[command(name = "--request", hide = true)]
-    Request,
     #[command(hide = true)]
     Daemon,
     #[command(hide = true)]
     Cleanup,
     #[command(hide = true)]
     Worker { spec: String },
-    #[command(hide = true)]
-    PowerEvent {
-        timestamp: i64,
-        id: String,
-        #[arg(action=clap::ArgAction::Set)]
-        cancel: bool,
-    },
 }
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -133,20 +123,9 @@ fn rpc(r: Request) -> Result<()> {
     validate(&r, Utc::now())?;
     let bytes = serde_json::to_vec(&r)?;
     anyhow::ensure!(bytes.len() <= 65536, "serialized request exceeds 64 KiB");
-    let mut p = Command::new("/usr/bin/sudo")
-        .args(["-n", BIN, "--request"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("could not start installed helper; run scripts/install.sh first")?;
-    let write_result = p.stdin.take().unwrap().write_all(&bytes);
-    let status = p.wait()?;
-    if !status.success() {
-        // The helper/sudo already emitted the actual error. Preserve it once.
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    write_result?;
-    Ok(())
+    output(&service::handle(r)?)
 }
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("{}", serde_json::json!({"error":format!("{e:#}")}));
@@ -154,21 +133,10 @@ fn main() {
     }
 }
 fn run() -> Result<()> {
-    // The sudoers rule permits only this exact argument, with a bounded JSON request on stdin.
-    if std::env::args()
-        .collect::<Vec<_>>()
-        .get(1)
-        .map(String::as_str)
-        == Some("--request")
-    {
-        anyhow::ensure!(std::env::args().count() == 2, "unexpected arguments");
-        let mut bytes = Vec::new();
-        std::io::stdin().take(65537).read_to_end(&mut bytes)?;
-        anyhow::ensure!(bytes.len() <= 65536, "request too large");
-        let request: Request = serde_json::from_slice(&bytes)?;
-        validate(&request, Utc::now())?;
-        return output(&service::handle(request)?);
-    }
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } != 0,
+        "oats refuses to run as root"
+    );
     match Cli::parse().command {
         Action::Schedule {
             at,
@@ -200,22 +168,15 @@ fn run() -> Result<()> {
             })
         }
         Action::Doctor => output(&serde_json::json!({
-            "installed": std::path::Path::new(BIN).exists(),
+            "installed": root()?.join("bin/oats").exists(),
             "power": service::system("/usr/bin/pmset", &["-g", "batt"] )?,
-            "scheduled_wakes": service::system("/usr/bin/pmset", &["-g", "sched"] )?,
-            "sleep_settings": service::system("/usr/bin/pmset", &["-g"] )?,
-            "closed_lid_verified": false,
-            "note": "Run probe, close the lid on AC, then inspect status and logs. Firmware may ignore closed-lid wakes."
+            "mode": "unprivileged_awake_only",
+            "note": "Jobs run while awake and on AC. Sleep defers jobs until wake, within their grace period."
+
         })),
         Action::Daemon => service::daemon(),
         Action::Cleanup => service::cleanup(),
         Action::Worker { spec } => worker::run(&spec),
-        Action::PowerEvent {
-            timestamp,
-            id,
-            cancel,
-        } => power::event(timestamp, &id, cancel),
-        Action::Request => bail!("use --request"),
     }
 }
 

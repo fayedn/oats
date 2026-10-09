@@ -1,15 +1,14 @@
-use crate::{ROOT, Request};
+use crate::Request;
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         Arc,
@@ -19,18 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Serialize, Deserialize)]
-struct Config {
-    uid: u32,
-    gid: u32,
-    user: String,
-    home: String,
-}
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Job {
     id: String,
     at: DateTime<Utc>,
-    wake_time: String,
     timeout: u64,
     grace: u64,
     cwd: String,
@@ -41,23 +32,20 @@ struct Job {
     exit_code: Option<i32>,
     error: Option<String>,
     cancel: bool,
-    #[serde(default)]
-    wake_cleanup: bool,
 }
 #[derive(Serialize, Deserialize, Default, PartialEq)]
 struct State {
     jobs: Vec<Job>,
-    restore_sleep: Option<bool>,
     heartbeat: Option<DateTime<Utc>>,
 }
 struct Store {
     root: PathBuf,
 }
 impl Store {
-    fn new() -> Self {
-        Self {
-            root: PathBuf::from(ROOT),
-        }
+    fn new() -> Result<Self> {
+        let root = crate::root()?;
+        ensure!(root.join("logs").is_dir(), "run scripts/install.sh first");
+        Ok(Self { root })
     }
     fn lock(&self, name: &str) -> Result<File> {
         let f = OpenOptions::new()
@@ -167,18 +155,6 @@ pub fn system(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-fn config() -> Result<Config> {
-    ensure!(
-        unsafe { libc::geteuid() } == 0,
-        "privileged helper must run as root"
-    );
-    let c: Config = serde_json::from_slice(&fs::read(Path::new(ROOT).join("config.json"))?)?;
-    ensure!(
-        c.uid > 0 && c.gid > 0 && c.home.starts_with('/'),
-        "invalid installed account"
-    );
-    Ok(c)
-}
 fn on_ac(text: &str) -> bool {
     text.lines()
         .next()
@@ -187,34 +163,6 @@ fn on_ac(text: &str) -> bool {
 fn ac() -> Result<bool> {
     Ok(on_ac(&system("/usr/bin/pmset", &["-g", "batt"])?))
 }
-fn sleep_disabled() -> Result<bool> {
-    let text = system("/usr/bin/pmset", &["-g"])?;
-    Ok(text.lines().any(|line| {
-        let p: Vec<_> = line.split_whitespace().collect();
-        p.first() == Some(&"SleepDisabled") && p.get(1) == Some(&"1")
-    }))
-}
-fn set_sleep(disabled: bool) -> Result<()> {
-    system(
-        "/usr/bin/pmset",
-        &["-a", "disablesleep", if disabled { "1" } else { "0" }],
-    )?;
-    Ok(())
-}
-fn wake(job: &Job, cancel: bool) -> Result<()> {
-    // Execute native scheduling in a bounded child, just like pmset queries.
-    system(
-        crate::BIN,
-        &[
-            "power-event",
-            &job.at.timestamp().to_string(),
-            &job.id,
-            if cancel { "true" } else { "false" },
-        ],
-    )?;
-    Ok(())
-}
-
 fn healthy(store: &Store) -> bool {
     fs::metadata(store.root.join("heartbeat"))
         .and_then(|m| m.modified())
@@ -233,112 +181,84 @@ fn heartbeat(store: &Store) -> Result<()> {
 }
 
 pub fn handle(r: Request) -> Result<Value> {
-    let c = config()?;
-    let caller = std::env::var("SUDO_UID")
-        .context("request must originate through sudo")?
-        .parse::<u32>()?;
-    ensure!(
-        caller == c.uid,
-        "this installation belongs to a different user"
-    );
-    let store = Store::new();
+    let store = Store::new()?;
     match r {
-        Request::Schedule{at,timeout,grace,cwd,command} => store.transaction(|s| {
-            ensure!(healthy(&store),"daemon is not healthy; inspect launchctl print system/dev.oats");
-            ensure!(ac()?,"V1 only accepts jobs while connected to AC power");
-            ensure!(s.jobs.len()<1000,"history quota reached (1000 jobs); archive via uninstall before adding jobs");
-            ensure!(s.jobs.iter().filter(|j|j.state=="queued").count()<32,"maximum 32 pending jobs");
-            let job=Job{id:uuid::Uuid::new_v4().to_string(),at,
-                wake_time:at.with_timezone(&Local).format("%m/%d/%y %H:%M:%S").to_string(),
-                timeout,grace,cwd,command,state:"queued".into(),started:None,finished:None,exit_code:None,error:None,cancel:false,wake_cleanup:true};
-            // Persist an intent while holding the state lock, before touching hardware.
-            let mut job = job;
-            job.state = "arming".into();
+        Request::Schedule {
+            at,
+            timeout,
+            grace,
+            cwd,
+            command,
+        } => store.transaction(|s| {
+            ensure!(
+                healthy(&store),
+                "daemon is not healthy; inspect the user LaunchAgent dev.oats"
+            );
+            ensure!(ac()?, "V1 only accepts jobs while connected to AC power");
+            ensure!(
+                s.jobs.len() < 1000,
+                "history quota reached (1000 jobs); archive via uninstall before adding jobs"
+            );
+            ensure!(
+                s.jobs.iter().filter(|j| j.state == "queued").count() < 32,
+                "maximum 32 pending jobs"
+            );
+            let job = Job {
+                id: uuid::Uuid::new_v4().to_string(),
+                at,
+                timeout,
+                grace,
+                cwd,
+                command,
+                state: "queued".into(),
+                started: None,
+                finished: None,
+                exit_code: None,
+                error: None,
+                cancel: false,
+            };
             s.jobs.push(job.clone());
-            store.save(s)?;
-            wake(&job,false)?;
-            job.state = "queued".into();
-            job.wake_cleanup = false;
-            *s.jobs.last_mut().unwrap() = job.clone();
-            let result=json!({"job":job,"warning":"Closed-lid wake is best-effort until verified with probe on this Mac."});
-            Ok(result)
+            Ok(json!({"job":job}))
         }),
         Request::Status {} => {
-            let _lock=store.lock("state.lock")?; let s=store.read()?;
-            Ok(json!({"daemon_healthy":healthy(&store),"heartbeat":fs::metadata(store.root.join("heartbeat")).and_then(|m|m.modified()).ok().map(DateTime::<Utc>::from),"restore_pending":s.restore_sleep.is_some(),"jobs":s.jobs}))
+            let _lock = store.lock("state.lock")?;
+            let s = store.read()?;
+            Ok(
+                json!({"daemon_healthy":healthy(&store),"heartbeat":fs::metadata(store.root.join("heartbeat")).and_then(|m|m.modified()).ok().map(DateTime::<Utc>::from),"jobs":s.jobs}),
+            )
         }
-        Request::Cancel{id} => {
+        Request::Cancel { id } => {
             let job = store.transaction(|s| {
-                let j=s.jobs.iter_mut().find(|j|j.id==id).context("unknown job")?;
-                if j.state=="queued" || j.state=="arming" {
-                    j.state="cancelled".into(); j.finished=Some(Utc::now()); j.wake_cleanup=true;
-                } else if j.state=="running" {j.cancel=true;}
+                let j = s
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.id == id)
+                    .context("unknown job")?;
+                if j.state == "queued" {
+                    j.state = "cancelled".into();
+                    j.finished = Some(Utc::now());
+                } else if j.state == "running" {
+                    j.cancel = true;
+                }
                 Ok(j.clone())
             })?;
-            let warning = reconcile(&store).err().map(|e|format!("wake removal pending: {e:#}"));
-            Ok(json!({"job":job,"warning":warning}))
-        },
-        Request::Logs{id} => {
-            let _lock=store.lock("state.lock")?;
-            ensure!(store.read()?.jobs.iter().any(|j|j.id==id),"unknown job");
-            let path=store.log(&id);
-            if !path.exists() {return Ok(json!({"output":""}));}
-            let mut f=File::open(path)?; let len=f.metadata()?.len();
+            Ok(json!({"job":job}))
+        }
+        Request::Logs { id } => {
+            let _lock = store.lock("state.lock")?;
+            ensure!(store.read()?.jobs.iter().any(|j| j.id == id), "unknown job");
+            let path = store.log(&id);
+            if !path.exists() {
+                return Ok(json!({"output":""}));
+            }
+            let mut f = File::open(path)?;
+            let len = f.metadata()?.len();
             f.seek(SeekFrom::Start(len.saturating_sub(65536)))?;
-            let mut buf=Vec::new(); f.take(65536).read_to_end(&mut buf)?;
+            let mut buf = Vec::new();
+            f.take(65536).read_to_end(&mut buf)?;
             Ok(json!({"output":String::from_utf8_lossy(&buf),"truncated":len>65536}))
         }
     }
-}
-// Every operation here is idempotent, including after a successful cancellation
-// followed by a failed state save. The state lock excludes in-flight registration.
-fn reconcile(store: &Store) -> Result<()> {
-    store.transaction(|s| {
-        for job in &mut s.jobs {
-            if job.state == "arming" {
-                job.state = "failed".into();
-                job.finished = Some(Utc::now());
-                job.error = Some("registration interrupted; command was not started".into());
-                job.wake_cleanup = true;
-            }
-            if job.wake_cleanup {
-                wake(job, true)?;
-                job.wake_cleanup = false;
-            }
-        }
-        Ok(())
-    })
-}
-fn restore(store: &Store) -> Result<()> {
-    restore_with(store, set_sleep)
-}
-fn restore_with(store: &Store, set: impl Fn(bool) -> Result<()>) -> Result<()> {
-    store.transaction(|s| {
-        if let Some(previous) = s.restore_sleep {
-            set(previous)?;
-            s.restore_sleep = None;
-        }
-        Ok(())
-    })
-}
-fn acquire(store: &Store) -> Result<()> {
-    acquire_with(store, sleep_disabled, set_sleep)
-}
-fn acquire_with(
-    store: &Store,
-    read: impl Fn() -> Result<bool>,
-    set: impl Fn(bool) -> Result<()>,
-) -> Result<()> {
-    store.transaction(|s| {
-        ensure!(
-            s.restore_sleep.is_none(),
-            "previous sleep restoration is pending"
-        );
-        s.restore_sleep = Some(read()?);
-        Ok(())
-    })?;
-    // Durable recovery journal precedes the global setting change.
-    set(true)
 }
 fn finish(
     store: &Store,
@@ -371,7 +291,7 @@ fn disposition(j: &Job, now: DateTime<Utc>, ac: bool) -> Option<&'static str> {
         Some("running")
     }
 }
-fn spawn(job: &Job, c: &Config, store: &Store) -> Result<Child> {
+fn spawn(job: &Job, store: &Store) -> Result<Child> {
     let log = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -382,7 +302,7 @@ fn spawn(job: &Job, c: &Config, store: &Store) -> Result<Child> {
         .write(true)
         .mode(0o600)
         .open(store.root.join(format!("{}.result", job.id)))?;
-    let mut cmd = Command::new(crate::BIN);
+    let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args([
         "worker",
         &serde_json::to_string(&crate::worker::Spec {
@@ -395,30 +315,12 @@ fn spawn(job: &Job, c: &Config, store: &Store) -> Result<Child> {
         "PATH",
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     )
-    .env("HOME", &c.home)
-    .env("USER", &c.user)
-    .env("LOGNAME", &c.user)
+    .env("HOME", std::env::var_os("HOME").context("HOME is not set")?)
     .env("TMPDIR", "/tmp")
     .stdin(Stdio::piped())
     .stdout(log)
     .stderr(outcome);
-    let cwd = CString::new(job.cwd.as_str())?;
-    let uid = c.uid;
-    let gid = c.gid;
-    // No shell interpolation. Drop all root credentials before resolving the working directory or exec.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::setpgid(0, 0) != 0
-                || libc::setgroups(0, std::ptr::null()) != 0
-                || libc::setgid(gid) != 0
-                || libc::setuid(uid) != 0
-                || libc::chdir(cwd.as_ptr()) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    cmd.current_dir(&job.cwd).process_group(0);
     cmd.spawn().context("could not start user command")
 }
 struct Running {
@@ -459,8 +361,7 @@ impl Drop for Running {
 }
 
 pub fn daemon() -> Result<()> {
-    let c = config()?;
-    let store = Store::new();
+    let store = Store::new()?;
     let daemon_lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -473,7 +374,6 @@ pub fn daemon() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
-    restore(&store)?;
     store.transaction(|s| {
         for j in &mut s.jobs {
             if j.state == "running" {
@@ -485,11 +385,9 @@ pub fn daemon() -> Result<()> {
         Ok(())
     })?;
     let mut running: Option<Running> = None;
-    let mut lease_held = false;
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed) {
             heartbeat(&store)?;
-            reconcile(&store)?;
             // A failed power query is treated as loss of AC, not permission to continue.
             let power = ac().unwrap_or(false);
             if let Some(r) = running.as_mut() {
@@ -544,8 +442,6 @@ pub fn daemon() -> Result<()> {
                         None,
                     )?;
                     running = None;
-                    // Keep the lease until the next due job is selected, avoiding a
-                    // lid-sleep gap between jobs with overlapping schedules.
                 }
             }
             if running.is_none() {
@@ -564,11 +460,9 @@ pub fn daemon() -> Result<()> {
                     Ok(None)
                 })?;
                 if let Some(j) = next {
-                    let attempt = (if lease_held { Ok(()) } else { acquire(&store) })
-                        .and_then(|_| spawn(&j, &c, &store));
+                    let attempt = spawn(&j, &store);
                     match attempt {
                         Ok(child) => {
-                            lease_held = true;
                             running = Some(Running {
                                 child,
                                 started: Instant::now(),
@@ -578,13 +472,8 @@ pub fn daemon() -> Result<()> {
                         }
                         Err(e) => {
                             finish(&store, &j.id, "failed", None, Some(format!("{e:#}")))?;
-                            restore(&store)?;
-                            lease_held = false;
                         }
                     }
-                } else if lease_held {
-                    restore(&store)?;
-                    lease_held = false;
                 }
             }
             thread::sleep(Duration::from_secs(2));
@@ -603,7 +492,6 @@ pub fn daemon() -> Result<()> {
     } else {
         Ok(())
     };
-    restore(&store)?;
     finish_result?;
     let _ = fs::remove_file(store.root.join("heartbeat"));
     store.transaction(|s| {
@@ -613,8 +501,7 @@ pub fn daemon() -> Result<()> {
     result
 }
 pub fn cleanup() -> Result<()> {
-    config()?;
-    let store = Store::new();
+    let store = Store::new()?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -623,19 +510,16 @@ pub fn cleanup() -> Result<()> {
         .open(store.root.join("daemon.lock"))?;
     lock.try_lock_exclusive()
         .context("stop the daemon before cleanup")?;
-    restore(&store)?;
     store.transaction(|s| {
         for j in &mut s.jobs {
-            if j.state == "queued" || j.state == "arming" {
+            if j.state == "queued" {
                 j.state = "cancelled".into();
                 j.finished = Some(Utc::now());
-                j.wake_cleanup = true;
             }
         }
         s.heartbeat = None;
         Ok(())
     })?;
-    reconcile(&store)?;
     let _ = fs::remove_file(store.root.join("heartbeat"));
     println!("{}", json!({"cleaned":true}));
     Ok(())
@@ -648,7 +532,6 @@ mod tests {
         Job {
             id: uuid::Uuid::new_v4().to_string(),
             at: Utc::now() - chrono::Duration::seconds(5),
-            wake_time: String::new(),
             timeout: 10,
             grace: 60,
             cwd: "/tmp".into(),
@@ -659,7 +542,6 @@ mod tests {
             exit_code: None,
             error: None,
             cancel: false,
-            wake_cleanup: false,
         }
     }
     #[test]
@@ -696,13 +578,11 @@ mod tests {
         };
         store
             .transaction(|s| {
-                s.restore_sleep = Some(false);
                 s.jobs.push(job());
                 Ok(())
             })
             .unwrap();
         let state = store.read().unwrap();
-        assert_eq!(state.restore_sleep, Some(false));
         assert_eq!(state.jobs.len(), 1);
     }
     #[test]
@@ -723,44 +603,6 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(store.read().unwrap().jobs.len(), 1);
-    }
-    #[test]
-    fn restoration_failure_keeps_recovery_journal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store {
-            root: tmp.path().into(),
-        };
-        acquire_with(
-            &store,
-            || Ok(false),
-            |value| {
-                assert!(value);
-                assert_eq!(store.read()?.restore_sleep, Some(false));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(restore_with(&store, |_| anyhow::bail!("simulated pmset failure")).is_err());
-        assert_eq!(store.read().unwrap().restore_sleep, Some(false));
-        restore_with(&store, |value| {
-            assert!(!value);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(store.read().unwrap().restore_sleep, None);
-    }
-    #[test]
-    fn preserves_preexisting_sleep_prevention() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store {
-            root: tmp.path().into(),
-        };
-        acquire_with(&store, || Ok(true), |_| Ok(())).unwrap();
-        restore_with(&store, |value| {
-            assert!(value);
-            Ok(())
-        })
-        .unwrap();
     }
     #[test]
     fn audit_control_command_deadline_is_bounded() {
@@ -798,24 +640,6 @@ mod tests {
                 .modified()
                 .unwrap()
         );
-    }
-    #[test]
-    fn audit_registration_intent_survives_side_effect_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store {
-            root: tmp.path().into(),
-        };
-        let result: Result<()> = store.transaction(|s| {
-            let mut j = job();
-            j.state = "arming".into();
-            j.wake_cleanup = true;
-            s.jobs.push(j);
-            store.save(s)?;
-            anyhow::bail!("simulated power service failure");
-        });
-        assert!(result.is_err());
-        assert_eq!(store.read().unwrap().jobs[0].state, "arming");
-        assert!(store.read().unwrap().jobs[0].wake_cleanup);
     }
     #[test]
     fn audit_stop_cleans_group_after_supervisor_is_killed() {
